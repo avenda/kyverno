@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.10.0
+    controller-gen.kubebuilder.io/version: v0.11.1
   creationTimestamp: null
   name: policies.kyverno.io
 spec:
@@ -11,7 +11,6 @@ spec:
   names:
     categories:
     - kyverno
-    - all
     kind: Policy
     listKind: PolicyList
     plural: policies
@@ -1731,6 +1730,9 @@ spec:
                                       type: object
                                   type: object
                                 type: array
+                              foreach:
+                                description: Foreach declares a nested foreach iterator
+                                x-kubernetes-preserve-unknown-fields: true
                               list:
                                 description: List specifies a JMESPath expression
                                   that results in one or more elements to which the
@@ -2044,6 +2046,9 @@ spec:
                                   scope within the foreach block to allow referencing
                                   other elements in the subtree.
                                 type: boolean
+                              foreach:
+                                description: Foreach declares a nested foreach iterator
+                                x-kubernetes-preserve-unknown-fields: true
                               list:
                                 description: List specifies a JMESPath expression
                                   that results in one or more elements to which the
@@ -2826,6 +2831,8 @@ spec:
                                   description: PredicateType defines the type of Predicate
                                     contained within the Statement.
                                   type: string
+                              required:
+                              - predicateType
                               type: object
                             type: array
                           attestors:
@@ -4818,6 +4825,10 @@ spec:
                                           type: object
                                       type: object
                                     type: array
+                                  foreach:
+                                    description: Foreach declares a nested foreach
+                                      iterator
+                                    x-kubernetes-preserve-unknown-fields: true
                                   list:
                                     description: List specifies a JMESPath expression
                                       that results in one or more elements to which
@@ -5143,6 +5154,10 @@ spec:
                                       as the validation scope within the foreach block
                                       to allow referencing other elements in the subtree.
                                     type: boolean
+                                  foreach:
+                                    description: Foreach declares a nested foreach
+                                      iterator
+                                    x-kubernetes-preserve-unknown-fields: true
                                   list:
                                     description: List specifies a JMESPath expression
                                       that results in one or more elements to which
@@ -5959,6 +5974,8 @@ spec:
                                       description: PredicateType defines the type
                                         of Predicate contained within the Statement.
                                       type: string
+                                  required:
+                                  - predicateType
                                   type: object
                                 type: array
                               attestors:
@@ -7635,6 +7652,9 @@ spec:
                                       type: object
                                   type: object
                                 type: array
+                              foreach:
+                                description: Foreach declares a nested foreach iterator
+                                x-kubernetes-preserve-unknown-fields: true
                               list:
                                 description: List specifies a JMESPath expression
                                   that results in one or more elements to which the
@@ -8116,6 +8136,9 @@ spec:
                                   scope within the foreach block to allow referencing
                                   other elements in the subtree.
                                 type: boolean
+                              foreach:
+                                description: Foreach declares a nested foreach iterator
+                                x-kubernetes-preserve-unknown-fields: true
                               list:
                                 description: List specifies a JMESPath expression
                                   that results in one or more elements to which the
@@ -8883,6 +8906,8 @@ spec:
                                   description: PredicateType defines the type of Predicate
                                     contained within the Statement.
                                   type: string
+                              required:
+                              - predicateType
                               type: object
                             type: array
                           attestors:
@@ -10849,6 +10874,10 @@ spec:
                                           type: object
                                       type: object
                                     type: array
+                                  foreach:
+                                    description: Foreach declares a nested foreach
+                                      iterator
+                                    x-kubernetes-preserve-unknown-fields: true
                                   list:
                                     description: List specifies a JMESPath expression
                                       that results in one or more elements to which
@@ -11174,6 +11203,10 @@ spec:
                                       as the validation scope within the foreach block
                                       to allow referencing other elements in the subtree.
                                     type: boolean
+                                  foreach:
+                                    description: Foreach declares a nested foreach
+                                      iterator
+                                    x-kubernetes-preserve-unknown-fields: true
                                   list:
                                     description: List specifies a JMESPath expression
                                       that results in one or more elements to which
@@ -11990,6 +12023,8 @@ spec:
                                       description: PredicateType defines the type
                                         of Predicate contained within the Statement.
                                       type: string
+                                  required:
+                                  - predicateType
                                   type: object
                                 type: array
                               attestors:

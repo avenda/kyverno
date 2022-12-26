@@ -20,6 +20,8 @@ import (
 )
 
 type Interface interface {
+	// GetKubeClient provides typed kube client
+	GetKubeClient() kubernetes.Interface
 	// GetEventsInterface provides typed interface for events
 	GetEventsInterface() corev1.EventInterface
 	// GetDynamicInterface fetches underlying dynamic interface
@@ -42,7 +44,7 @@ type Interface interface {
 	// CreateResource creates object for the specified resource/namespace
 	CreateResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool) (*unstructured.Unstructured, error)
 	// UpdateResource updates object for the specified resource/namespace
-	UpdateResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool) (*unstructured.Unstructured, error)
+	UpdateResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool, subresources ...string) (*unstructured.Unstructured, error)
 	// UpdateStatusResource updates the resource "status" subresource
 	UpdateStatusResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool) (*unstructured.Unstructured, error)
 }
@@ -69,7 +71,7 @@ func NewClient(
 		rest: disco.RESTClient(),
 	}
 	// Set discovery client
-	discoveryClient := &serverPreferredResources{
+	discoveryClient := &serverResources{
 		cachedClient: memory.NewMemCacheClient(disco),
 	}
 	// client will invalidate registered resources cache every x seconds,
@@ -85,6 +87,11 @@ func NewClient(
 // NewDynamicSharedInformerFactory returns a new instance of DynamicSharedInformerFactory
 func (c *client) NewDynamicSharedInformerFactory(defaultResync time.Duration) dynamicinformer.DynamicSharedInformerFactory {
 	return dynamicinformer.NewDynamicSharedInformerFactory(c.dyn, defaultResync)
+}
+
+// GetKubeClient provides typed kube client
+func (c *client) GetKubeClient() kubernetes.Interface {
+	return c.kube
 }
 
 // GetEventsInterface provides typed interface for events
@@ -175,14 +182,14 @@ func (c *client) CreateResource(ctx context.Context, apiVersion string, kind str
 }
 
 // UpdateResource updates object for the specified resource/namespace
-func (c *client) UpdateResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool) (*unstructured.Unstructured, error) {
+func (c *client) UpdateResource(ctx context.Context, apiVersion string, kind string, namespace string, obj interface{}, dryRun bool, subresources ...string) (*unstructured.Unstructured, error) {
 	options := metav1.UpdateOptions{}
 	if dryRun {
 		options = metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}}
 	}
 	// convert typed to unstructured obj
 	if unstructuredObj, err := kubeutils.ConvertToUnstructured(obj); err == nil && unstructuredObj != nil {
-		return c.getResourceInterface(apiVersion, kind, namespace).Update(ctx, unstructuredObj, options)
+		return c.getResourceInterface(apiVersion, kind, namespace).Update(ctx, unstructuredObj, options, subresources...)
 	}
 	return nil, fmt.Errorf("unable to update resource ")
 }

@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,16 +12,25 @@ import (
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/engine"
-	"github.com/kyverno/kyverno/pkg/engine/context"
+	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
+	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
 	"github.com/kyverno/kyverno/pkg/engine/response"
+	"github.com/kyverno/kyverno/pkg/logging"
+	"github.com/kyverno/kyverno/pkg/registryclient"
 	jsonutils "github.com/kyverno/kyverno/pkg/utils/json"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // applyPolicy applies policy on a resource
-func applyPolicy(policy kyvernov1.PolicyInterface, resource unstructured.Unstructured,
-	logger logr.Logger, excludeGroupRole []string,
-	client dclient.Interface, namespaceLabels map[string]string,
+func applyPolicy(
+	policy kyvernov1.PolicyInterface,
+	resource unstructured.Unstructured,
+	logger logr.Logger,
+	excludeGroupRole []string,
+	client dclient.Interface,
+	rclient registryclient.Client,
+	informerCacheResolvers resolvers.ConfigmapResolver,
+	namespaceLabels map[string]string,
 ) (responses []*response.EngineResponse) {
 	startTime := time.Now()
 	defer func() {
@@ -37,12 +47,15 @@ func applyPolicy(policy kyvernov1.PolicyInterface, resource unstructured.Unstruc
 	var engineResponseMutation, engineResponseValidation *response.EngineResponse
 	var err error
 
-	ctx := context.NewContext()
-	err = context.AddResource(ctx, transformResource(resource))
+	ctx := enginecontext.NewContext()
+	data, err := resource.MarshalJSON()
+	if err != nil {
+		logging.Error(err, "failed to marshal resource")
+	}
+	err = enginecontext.AddResource(ctx, data)
 	if err != nil {
 		logger.Error(err, "failed to add transform resource to ctx")
 	}
-
 	err = ctx.AddNamespace(resource.GetNamespace())
 	if err != nil {
 		logger.Error(err, "failed to add namespace to ctx")
@@ -56,7 +69,7 @@ func applyPolicy(policy kyvernov1.PolicyInterface, resource unstructured.Unstruc
 		logger.Error(err, "unable to set operation in context")
 	}
 
-	engineResponseMutation, err = mutation(policy, resource, logger, ctx, namespaceLabels)
+	engineResponseMutation, err = mutation(policy, resource, logger, ctx, rclient, informerCacheResolvers, namespaceLabels)
 	if err != nil {
 		logger.Error(err, "failed to process mutation rule")
 	}
@@ -66,21 +79,31 @@ func applyPolicy(policy kyvernov1.PolicyInterface, resource unstructured.Unstruc
 		WithNewResource(resource).
 		WithNamespaceLabels(namespaceLabels).
 		WithClient(client).
-		WithExcludeGroupRole(excludeGroupRole...)
+		WithExcludeGroupRole(excludeGroupRole...).
+		WithInformerCacheResolver(informerCacheResolvers)
 
-	engineResponseValidation = engine.Validate(policyCtx)
+	engineResponseValidation = engine.Validate(context.TODO(), rclient, policyCtx)
 	engineResponses = append(engineResponses, mergeRuleRespose(engineResponseMutation, engineResponseValidation))
 
 	return engineResponses
 }
 
-func mutation(policy kyvernov1.PolicyInterface, resource unstructured.Unstructured, log logr.Logger, jsonContext context.Interface, namespaceLabels map[string]string) (*response.EngineResponse, error) {
+func mutation(
+	policy kyvernov1.PolicyInterface,
+	resource unstructured.Unstructured,
+	log logr.Logger,
+	jsonContext enginecontext.Interface,
+	rclient registryclient.Client,
+	informerCacheResolvers resolvers.ConfigmapResolver,
+	namespaceLabels map[string]string,
+) (*response.EngineResponse, error) {
 	policyContext := engine.NewPolicyContextWithJsonContext(jsonContext).
 		WithPolicy(policy).
 		WithNamespaceLabels(namespaceLabels).
-		WithNewResource(resource)
+		WithNewResource(resource).
+		WithInformerCacheResolver(informerCacheResolvers)
 
-	engineResponse := engine.Mutate(policyContext)
+	engineResponse := engine.Mutate(context.TODO(), rclient, policyContext)
 	if !engineResponse.IsSuccessful() {
 		log.V(4).Info("failed to apply mutation rules; reporting them")
 		return engineResponse, nil

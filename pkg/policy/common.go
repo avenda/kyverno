@@ -3,46 +3,16 @@ package policy
 import (
 	"context"
 	"reflect"
-	"strings"
 
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/config"
-	"github.com/kyverno/kyverno/pkg/logging"
-	"github.com/kyverno/kyverno/pkg/utils"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
-	wildcard "github.com/kyverno/kyverno/pkg/utils/wildcard"
+	"github.com/kyverno/kyverno/pkg/utils/wildcard"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 )
-
-func transformResource(resource unstructured.Unstructured) []byte {
-	data, err := resource.MarshalJSON()
-	if err != nil {
-		logging.Error(err, "failed to marshal resource")
-		return nil
-	}
-	return data
-}
-
-func ParseNamespacedPolicy(key string) (string, string, bool) {
-	namespace := ""
-	index := strings.Index(key, "/")
-	if index != -1 {
-		namespace = key[:index]
-		key = key[index+1:]
-		return namespace, key, true
-	}
-	return namespace, key, false
-}
-
-// MergeResources merges b into a map
-func MergeResources(a, b map[string]unstructured.Unstructured) {
-	for k, v := range b {
-		a[k] = v
-	}
-}
 
 func (pc *PolicyController) getResourceList(kind, namespace string, labelSelector *metav1.LabelSelector, log logr.Logger) *unstructured.UnstructuredList {
 	gv, k := kubeutils.GetKindFromGVK(kind)
@@ -123,7 +93,7 @@ func excludeResources(included map[string]unstructured.Unstructured, exclude kyv
 		if len(exclude.Namespaces) == 0 {
 			return NotEvaluate
 		}
-		if utils.ContainsNamepace(exclude.Namespaces, namespace) {
+		if wildcard.CheckPatterns(exclude.Namespaces, namespace) {
 			return Skip
 		}
 		return Process

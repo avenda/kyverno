@@ -3,15 +3,19 @@ package engine
 import (
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	kyvernov1beta1 "github.com/kyverno/kyverno/api/kyverno/v1beta1"
+	kyvernov2alpha1 "github.com/kyverno/kyverno/api/kyverno/v2alpha1"
+	kyvernov2alpha1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v2alpha1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/config"
-	"github.com/kyverno/kyverno/pkg/engine/context"
 	enginectx "github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
 	"github.com/kyverno/kyverno/pkg/utils"
 	"github.com/pkg/errors"
 	admissionv1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/cache"
 )
 
 // ExcludeFunc is a function used to determine if a resource is excluded
@@ -34,6 +38,16 @@ type PolicyContext struct {
 	// admissionInfo contains the admission request information
 	admissionInfo kyvernov1beta1.RequestInfo
 
+	// requestResource is the fully-qualified resource of the original API request (for example, v1.pods).
+	// If this is specified and differs from the value in "resource", an equivalent match and conversion was performed.
+	//
+	// For example, if deployments can be modified via apps/v1 and apps/v1beta1, and a webhook registered a rule of
+	// `apiGroups:["apps"], apiVersions:["v1"], resources: ["deployments"]` and `matchPolicy: Equivalent`,
+	// an API request to apps/v1beta1 deployments would be converted and sent to the webhook
+	// with `resource: {group:"apps", version:"v1", resource:"deployments"}` (matching the resource the webhook registered for),
+	// and `requestResource: {group:"apps", version:"v1beta1", resource:"deployments"}` (indicating the resource of the original API request).
+	requestResource metav1.GroupVersionResource
+
 	// Dynamic client - used for api lookups
 	client dclient.Interface
 
@@ -43,7 +57,7 @@ type PolicyContext struct {
 	excludeResourceFunc ExcludeFunc
 
 	// jsonContext is the variable context
-	jsonContext context.Interface
+	jsonContext enginectx.Interface
 
 	// namespaceLabels stores the label of namespace to be processed by namespace selector
 	namespaceLabels map[string]string
@@ -53,6 +67,20 @@ type PolicyContext struct {
 
 	// informerCacheResolvers - used to get resources from informer cache
 	informerCacheResolvers resolvers.ConfigmapResolver
+
+	// subresource is the subresource being requested, if any (for example, "status" or "scale")
+	subresource string
+
+	// subresourcesInPolicy represents the APIResources that are subresources along with their parent resource.
+	// This is used to determine if a resource is a subresource. It is only used when the policy context is populated
+	// by kyverno CLI. In all other cases when connected to a cluster, this is empty.
+	subresourcesInPolicy []struct {
+		APIResource    metav1.APIResource
+		ParentResource metav1.APIResource
+	}
+
+	// peLister list all policy exceptions
+	peLister kyvernov2alpha1listers.PolicyExceptionLister
 }
 
 // Getters
@@ -73,8 +101,29 @@ func (c *PolicyContext) AdmissionInfo() kyvernov1beta1.RequestInfo {
 	return c.admissionInfo
 }
 
-func (c *PolicyContext) JSONContext() context.Interface {
+func (c *PolicyContext) JSONContext() enginectx.Interface {
 	return c.jsonContext
+}
+
+func (c *PolicyContext) FindExceptions(rule string) ([]*kyvernov2alpha1.PolicyException, error) {
+	if c.peLister == nil {
+		return nil, nil
+	}
+	polexs, err := c.peLister.List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	var result []*kyvernov2alpha1.PolicyException
+	policyName, err := cache.MetaNamespaceKeyFunc(c.policy)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute policy key")
+	}
+	for _, polex := range polexs {
+		if polex.Contains(policyName, rule) {
+			result = append(result, polex)
+		}
+	}
+	return result, nil
 }
 
 // Mutators
@@ -94,6 +143,12 @@ func (c *PolicyContext) WithNamespaceLabels(namespaceLabels map[string]string) *
 func (c *PolicyContext) WithAdmissionInfo(admissionInfo kyvernov1beta1.RequestInfo) *PolicyContext {
 	copy := c.Copy()
 	copy.admissionInfo = admissionInfo
+	return copy
+}
+
+func (c *PolicyContext) WithRequestResource(requestResource metav1.GroupVersionResource) *PolicyContext {
+	copy := c.Copy()
+	copy.requestResource = requestResource
 	return copy
 }
 
@@ -147,9 +202,30 @@ func (c *PolicyContext) WithInformerCacheResolver(informerCacheResolver resolver
 	return copy
 }
 
-// Constructors
+func (c *PolicyContext) WithSubresource(subresource string) *PolicyContext {
+	copy := c.Copy()
+	copy.subresource = subresource
+	return copy
+}
 
-func NewPolicyContextWithJsonContext(jsonContext context.Interface) *PolicyContext {
+func (c *PolicyContext) WithSubresourcesInPolicy(subresourcesInPolicy []struct {
+	APIResource    metav1.APIResource
+	ParentResource metav1.APIResource
+},
+) *PolicyContext {
+	copy := c.Copy()
+	copy.subresourcesInPolicy = subresourcesInPolicy
+	return copy
+}
+
+func (c *PolicyContext) WithExceptions(peLister kyvernov2alpha1listers.PolicyExceptionLister) *PolicyContext {
+	copy := c.Copy()
+	copy.peLister = peLister
+	return copy
+}
+
+// Constructors
+func NewPolicyContextWithJsonContext(jsonContext enginectx.Interface) *PolicyContext {
 	return &PolicyContext{
 		jsonContext:      jsonContext,
 		excludeGroupRole: []string{},
@@ -160,7 +236,7 @@ func NewPolicyContextWithJsonContext(jsonContext context.Interface) *PolicyConte
 }
 
 func NewPolicyContext() *PolicyContext {
-	return NewPolicyContextWithJsonContext(context.NewContext())
+	return NewPolicyContextWithJsonContext(enginectx.NewContext())
 }
 
 func NewPolicyContextFromAdmissionRequest(
@@ -169,6 +245,7 @@ func NewPolicyContextFromAdmissionRequest(
 	configuration config.Configuration,
 	client dclient.Interface,
 	informerCacheResolver resolvers.ConfigmapResolver,
+	peLister kyvernov2alpha1listers.PolicyExceptionLister,
 ) (*PolicyContext, error) {
 	ctx, err := newVariablesContext(request, &admissionInfo)
 	if err != nil {
@@ -181,6 +258,7 @@ func NewPolicyContextFromAdmissionRequest(
 	if err := ctx.AddImageInfos(&newResource); err != nil {
 		return nil, errors.Wrap(err, "failed to add image information to the policy rule context")
 	}
+	requestResource := request.RequestResource.DeepCopy()
 	policyContext := NewPolicyContextWithJsonContext(ctx).
 		WithNewResource(newResource).
 		WithOldResource(oldResource).
@@ -188,7 +266,10 @@ func NewPolicyContextFromAdmissionRequest(
 		WithConfiguration(configuration).
 		WithClient(client).
 		WithAdmissionOperation(true).
-		WithInformerCacheResolver(informerCacheResolver)
+		WithInformerCacheResolver(informerCacheResolver).
+		WithRequestResource(*requestResource).
+		WithSubresource(request.SubResource).
+		WithExceptions(peLister)
 	return policyContext, nil
 }
 

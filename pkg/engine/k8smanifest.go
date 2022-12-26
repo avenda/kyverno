@@ -51,9 +51,9 @@ func handleVerifyManifest(ctx *PolicyContext, rule *kyvernov1.Rule, logger logr.
 	}
 	logger.V(3).Info("verifyManifest result", "verified", strconv.FormatBool(verified), "reason", reason)
 	if !verified {
-		return ruleResponse(*rule, response.Validation, reason, response.RuleStatusFail, nil)
+		return ruleResponse(*rule, response.Validation, reason, response.RuleStatusFail)
 	}
-	return ruleResponse(*rule, response.Validation, reason, response.RuleStatusPass, nil)
+	return ruleResponse(*rule, response.Validation, reason, response.RuleStatusPass)
 }
 
 func verifyManifest(policyContext *PolicyContext, verifyRule kyvernov1.Manifests, logger logr.Logger) (bool, string, error) {
@@ -399,7 +399,7 @@ func checkManifestAnnotations(mnfstAnnotations map[string]string, annotations ma
 }
 
 func checkDryRunPermission(dclient dclient.Interface, kind, namespace string) (bool, error) {
-	canI := auth.NewCanI(dclient, kind, namespace, "create")
+	canI := auth.NewCanI(dclient.Discovery(), dclient.GetKubeClient().AuthorizationV1().SelfSubjectAccessReviews(), kind, namespace, "create", "")
 	ok, err := canI.RunAccessCheck(context.TODO())
 	if err != nil {
 		return false, err

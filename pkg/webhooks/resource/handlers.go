@@ -10,8 +10,8 @@ import (
 	kyvernov1beta1 "github.com/kyverno/kyverno/api/kyverno/v1beta1"
 	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernov1beta1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1beta1"
+	kyvernov2alpha1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v2alpha1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
-	"github.com/kyverno/kyverno/pkg/common"
 	"github.com/kyverno/kyverno/pkg/config"
 	enginectx "github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
@@ -20,7 +20,9 @@ import (
 	"github.com/kyverno/kyverno/pkg/metrics"
 	"github.com/kyverno/kyverno/pkg/openapi"
 	"github.com/kyverno/kyverno/pkg/policycache"
+	"github.com/kyverno/kyverno/pkg/registryclient"
 	admissionutils "github.com/kyverno/kyverno/pkg/utils/admission"
+	engineutils "github.com/kyverno/kyverno/pkg/utils/engine"
 	jsonutils "github.com/kyverno/kyverno/pkg/utils/json"
 	"github.com/kyverno/kyverno/pkg/webhooks"
 	"github.com/kyverno/kyverno/pkg/webhooks/resource/generation"
@@ -38,6 +40,7 @@ type handlers struct {
 	// clients
 	client        dclient.Interface
 	kyvernoClient versioned.Interface
+	rclient       registryclient.Client
 
 	// config
 	configuration config.Configuration
@@ -51,6 +54,7 @@ type handlers struct {
 	rbLister  rbacv1listers.RoleBindingLister
 	crbLister rbacv1listers.ClusterRoleBindingLister
 	urLister  kyvernov1beta1listers.UpdateRequestNamespaceLister
+	peLister  kyvernov2alpha1listers.PolicyExceptionLister
 
 	urGenerator    webhookgenerate.Generator
 	eventGen       event.Interface
@@ -64,6 +68,7 @@ type handlers struct {
 func NewHandlers(
 	client dclient.Interface,
 	kyvernoClient versioned.Interface,
+	rclient registryclient.Client,
 	configuration config.Configuration,
 	metricsConfig metrics.MetricsConfigManager,
 	pCache policycache.Cache,
@@ -72,6 +77,7 @@ func NewHandlers(
 	rbLister rbacv1listers.RoleBindingLister,
 	crbLister rbacv1listers.ClusterRoleBindingLister,
 	urLister kyvernov1beta1listers.UpdateRequestNamespaceLister,
+	peLister kyvernov2alpha1listers.PolicyExceptionLister,
 	urGenerator webhookgenerate.Generator,
 	eventGen event.Interface,
 	openApiManager openapi.ValidateInterface,
@@ -80,6 +86,7 @@ func NewHandlers(
 	return &handlers{
 		client:           client,
 		kyvernoClient:    kyvernoClient,
+		rclient:          rclient,
 		configuration:    configuration,
 		metricsConfig:    metricsConfig,
 		pCache:           pCache,
@@ -87,10 +94,11 @@ func NewHandlers(
 		rbLister:         rbLister,
 		crbLister:        crbLister,
 		urLister:         urLister,
+		peLister:         peLister,
 		urGenerator:      urGenerator,
 		eventGen:         eventGen,
 		openApiManager:   openApiManager,
-		pcBuilder:        webhookutils.NewPolicyContextBuilder(configuration, client, rbLister, crbLister, informerCacheResolvers),
+		pcBuilder:        webhookutils.NewPolicyContextBuilder(configuration, client, rbLister, crbLister, informerCacheResolvers, peLister),
 		urUpdater:        webhookutils.NewUpdateRequestUpdater(kyvernoClient, urLister),
 		admissionReports: admissionReports,
 	}
@@ -113,8 +121,8 @@ func (h *handlers) Validate(ctx context.Context, logger logr.Logger, request *ad
 	}
 	if len(generatePolicies) == 0 && request.Operation == admissionv1.Update {
 		// handle generate source resource updates
-		gh := generation.NewGenerationHandler(logger, h.client, h.kyvernoClient, h.nsLister, h.urLister, h.urGenerator, h.urUpdater, h.eventGen)
-		go gh.HandleUpdatesForGenerateRules(request, []kyvernov1.PolicyInterface{})
+		gh := generation.NewGenerationHandler(logger, h.client, h.kyvernoClient, h.rclient, h.nsLister, h.urLister, h.urGenerator, h.urUpdater, h.eventGen, h.metricsConfig)
+		go gh.HandleUpdatesForGenerateRules(context.TODO(), request, []kyvernov1.PolicyInterface{})
 	}
 
 	logger.V(4).Info("processing policies for validate admission request", "validate", len(policies), "mutate", len(mutatePolicies), "generate", len(generatePolicies))
@@ -126,12 +134,12 @@ func (h *handlers) Validate(ctx context.Context, logger logr.Logger, request *ad
 
 	namespaceLabels := make(map[string]string)
 	if request.Kind.Kind != "Namespace" && request.Namespace != "" {
-		namespaceLabels = common.GetNamespaceSelectorsFromNamespaceLister(request.Kind.Kind, request.Namespace, h.nsLister, logger)
+		namespaceLabels = engineutils.GetNamespaceSelectorsFromNamespaceLister(request.Kind.Kind, request.Namespace, h.nsLister, logger)
 	}
 
-	vh := validation.NewValidationHandler(logger, h.kyvernoClient, h.pCache, h.pcBuilder, h.eventGen, h.admissionReports)
+	vh := validation.NewValidationHandler(logger, h.kyvernoClient, h.rclient, h.pCache, h.pcBuilder, h.eventGen, h.admissionReports, h.metricsConfig)
 
-	ok, msg, warnings := vh.HandleValidation(h.metricsConfig, request, policies, policyContext, namespaceLabels, startTime)
+	ok, msg, warnings := vh.HandleValidation(ctx, request, policies, policyContext, namespaceLabels, startTime)
 	if !ok {
 		logger.Info("admission request denied")
 		return admissionutils.Response(request.UID, errors.New(msg), warnings...)
@@ -163,8 +171,8 @@ func (h *handlers) Mutate(ctx context.Context, logger logr.Logger, request *admi
 	if err := enginectx.MutateResourceWithImageInfo(request.Object.Raw, policyContext.JSONContext()); err != nil {
 		logger.Error(err, "failed to patch images info to resource, policies that mutate images may be impacted")
 	}
-	mh := mutation.NewMutationHandler(logger, h.eventGen, h.openApiManager, h.nsLister)
-	mutatePatches, mutateWarnings, err := mh.HandleMutation(h.metricsConfig, request, mutatePolicies, policyContext, startTime)
+	mh := mutation.NewMutationHandler(logger, h.rclient, h.eventGen, h.openApiManager, h.nsLister, h.metricsConfig)
+	mutatePatches, mutateWarnings, err := mh.HandleMutation(ctx, request, mutatePolicies, policyContext, startTime)
 	if err != nil {
 		logger.Error(err, "mutation failed")
 		return admissionutils.Response(request.UID, err)
@@ -176,8 +184,8 @@ func (h *handlers) Mutate(ctx context.Context, logger logr.Logger, request *admi
 		logger.Error(err, "failed to build policy context")
 		return admissionutils.Response(request.UID, err)
 	}
-	ivh := imageverification.NewImageVerificationHandler(logger, h.kyvernoClient, h.eventGen, h.admissionReports)
-	imagePatches, imageVerifyWarnings, err := ivh.Handle(h.metricsConfig, newRequest, verifyImagesPolicies, policyContext)
+	ivh := imageverification.NewImageVerificationHandler(logger, h.kyvernoClient, h.rclient, h.eventGen, h.admissionReports)
+	imagePatches, imageVerifyWarnings, err := ivh.Handle(ctx, newRequest, verifyImagesPolicies, policyContext)
 	if err != nil {
 		logger.Error(err, "image verification failed")
 		return admissionutils.Response(request.UID, err)

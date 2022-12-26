@@ -19,15 +19,17 @@ import (
 	kyvernov1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
 	kyvernov1beta1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1beta1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
-	pkgcommon "github.com/kyverno/kyverno/pkg/common"
 	"github.com/kyverno/kyverno/pkg/config"
 	"github.com/kyverno/kyverno/pkg/engine"
 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
+	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
 	"github.com/kyverno/kyverno/pkg/engine/response"
 	"github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	"github.com/kyverno/kyverno/pkg/event"
-	kyvernoutils "github.com/kyverno/kyverno/pkg/utils"
+	"github.com/kyverno/kyverno/pkg/registryclient"
+	datautils "github.com/kyverno/kyverno/pkg/utils/data"
+	engineutils "github.com/kyverno/kyverno/pkg/utils/engine"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	"golang.org/x/exp/slices"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +45,7 @@ type GenerateController struct {
 	client        dclient.Interface
 	kyvernoClient versioned.Interface
 	statusControl common.StatusControlInterface
+	rclient       registryclient.Client
 
 	// listers
 	urLister      kyvernov1beta1listers.UpdateRequestNamespaceLister
@@ -50,8 +53,9 @@ type GenerateController struct {
 	policyLister  kyvernov1listers.ClusterPolicyLister
 	npolicyLister kyvernov1listers.PolicyLister
 
-	configuration config.Configuration
-	eventGen      event.Interface
+	configuration          config.Configuration
+	informerCacheResolvers resolvers.ConfigmapResolver
+	eventGen               event.Interface
 
 	log logr.Logger
 }
@@ -61,25 +65,29 @@ func NewGenerateController(
 	client dclient.Interface,
 	kyvernoClient versioned.Interface,
 	statusControl common.StatusControlInterface,
+	rclient registryclient.Client,
 	policyLister kyvernov1listers.ClusterPolicyLister,
 	npolicyLister kyvernov1listers.PolicyLister,
 	urLister kyvernov1beta1listers.UpdateRequestNamespaceLister,
 	nsLister corev1listers.NamespaceLister,
 	dynamicConfig config.Configuration,
+	informerCacheResolvers resolvers.ConfigmapResolver,
 	eventGen event.Interface,
 	log logr.Logger,
 ) *GenerateController {
 	c := GenerateController{
-		client:        client,
-		kyvernoClient: kyvernoClient,
-		statusControl: statusControl,
-		policyLister:  policyLister,
-		npolicyLister: npolicyLister,
-		urLister:      urLister,
-		nsLister:      nsLister,
-		configuration: dynamicConfig,
-		eventGen:      eventGen,
-		log:           log,
+		client:                 client,
+		kyvernoClient:          kyvernoClient,
+		statusControl:          statusControl,
+		rclient:                rclient,
+		policyLister:           policyLister,
+		npolicyLister:          npolicyLister,
+		urLister:               urLister,
+		nsLister:               nsLister,
+		configuration:          dynamicConfig,
+		informerCacheResolvers: informerCacheResolvers,
+		eventGen:               eventGen,
+		log:                    log,
 	}
 	return &c
 }
@@ -149,7 +157,7 @@ func (c *GenerateController) ProcessUR(ur *kyvernov1beta1.UpdateRequest) error {
 	}
 
 	// 2 - Apply the generate policy on the resource
-	namespaceLabels := pkgcommon.GetNamespaceSelectorsFromNamespaceLister(resource.GetKind(), resource.GetNamespace(), c.nsLister, logger)
+	namespaceLabels := engineutils.GetNamespaceSelectorsFromNamespaceLister(resource.GetKind(), resource.GetNamespace(), c.nsLister, logger)
 	genResources, precreatedResource, err = c.applyGenerate(*resource, *ur, namespaceLabels)
 
 	if err != nil {
@@ -189,13 +197,13 @@ func (c *GenerateController) applyGenerate(resource unstructured.Unstructured, u
 		return nil, false, err
 	}
 
-	policyContext, precreatedResource, err := common.NewBackgroundContext(c.client, &ur, &policy, &resource, c.configuration, namespaceLabels, logger)
+	policyContext, precreatedResource, err := common.NewBackgroundContext(c.client, &ur, &policy, &resource, c.configuration, c.informerCacheResolvers, namespaceLabels, logger)
 	if err != nil {
 		return nil, precreatedResource, err
 	}
 
 	// check if the policy still applies to the resource
-	engineResponse := engine.GenerateResponse(policyContext, ur)
+	engineResponse := engine.GenerateResponse(c.rclient, policyContext, ur)
 	if len(engineResponse.PolicyResponse.Rules) == 0 {
 		logger.V(4).Info(doesNotApply)
 		return nil, false, errors.New(doesNotApply)
@@ -341,7 +349,7 @@ func (c *GenerateController) ApplyGeneratePolicy(log logr.Logger, policyContext 
 		}
 
 		// add configmap json data to context
-		if err := engine.LoadContext(log, rule.Context, policyContext, rule.Name); err != nil {
+		if err := engine.LoadContext(context.TODO(), log, c.rclient, rule.Context, policyContext, rule.Name); err != nil {
 			log.Error(err, "cannot add configmaps to context")
 			return nil, processExisting, err
 		}
@@ -587,7 +595,7 @@ func newGenResource(genAPIVersion, genKind, genNamespace, genName string) kyvern
 }
 
 func manageData(log logr.Logger, apiVersion, kind, namespace, name string, data interface{}, synchronize bool, ur kyvernov1beta1.UpdateRequest, client dclient.Interface) (map[string]interface{}, ResourceMode, error) {
-	resource, err := kyvernoutils.ToMap(data)
+	resource, err := datautils.ToMap(data)
 	if err != nil {
 		return nil, Skip, err
 	}
@@ -841,7 +849,7 @@ func (c *GenerateController) GetUnstrResource(genResourceSpec kyvernov1.Resource
 
 func deleteGeneratedResources(log logr.Logger, client dclient.Interface, ur kyvernov1beta1.UpdateRequest) error {
 	for _, genResource := range ur.Status.GeneratedResources {
-		err := client.DeleteResource(context.TODO(), "", genResource.Kind, genResource.Namespace, genResource.Name, false)
+		err := client.DeleteResource(context.TODO(), genResource.APIVersion, genResource.Kind, genResource.Namespace, genResource.Name, false)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}

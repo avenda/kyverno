@@ -22,8 +22,10 @@ import (
 	kyvernov1beta1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1beta1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/config"
+	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
 	"github.com/kyverno/kyverno/pkg/event"
 	"github.com/kyverno/kyverno/pkg/metrics"
+	"github.com/kyverno/kyverno/pkg/registryclient"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
@@ -53,8 +55,10 @@ const (
 type PolicyController struct {
 	client        dclient.Interface
 	kyvernoClient versioned.Interface
-	pInformer     kyvernov1informers.ClusterPolicyInformer
-	npInformer    kyvernov1informers.PolicyInformer
+	rclient       registryclient.Client
+
+	pInformer  kyvernov1informers.ClusterPolicyInformer
+	npInformer kyvernov1informers.PolicyInformer
 
 	eventGen      event.Interface
 	eventRecorder record.EventRecorder
@@ -73,6 +77,8 @@ type PolicyController struct {
 
 	// nsLister can list/get namespaces from the shared informer's store
 	nsLister corev1listers.NamespaceLister
+
+	informerCacheResolvers resolvers.ConfigmapResolver
 
 	informersSynced []cache.InformerSynced
 
@@ -93,12 +99,14 @@ type PolicyController struct {
 func NewPolicyController(
 	kyvernoClient versioned.Interface,
 	client dclient.Interface,
+	rclient registryclient.Client,
 	pInformer kyvernov1informers.ClusterPolicyInformer,
 	npInformer kyvernov1informers.PolicyInformer,
 	urInformer kyvernov1beta1informers.UpdateRequestInformer,
 	configHandler config.Configuration,
 	eventGen event.Interface,
 	namespaces corev1informers.NamespaceInformer,
+	informerCacheResolvers resolvers.ConfigmapResolver,
 	log logr.Logger,
 	reconcilePeriod time.Duration,
 	metricsConfig metrics.MetricsConfigManager,
@@ -110,17 +118,19 @@ func NewPolicyController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: eventInterface})
 
 	pc := PolicyController{
-		client:          client,
-		kyvernoClient:   kyvernoClient,
-		pInformer:       pInformer,
-		npInformer:      npInformer,
-		eventGen:        eventGen,
-		eventRecorder:   eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "policy_controller"}),
-		queue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "policy"),
-		configHandler:   configHandler,
-		reconcilePeriod: reconcilePeriod,
-		metricsConfig:   metricsConfig,
-		log:             log,
+		client:                 client,
+		kyvernoClient:          kyvernoClient,
+		rclient:                rclient,
+		pInformer:              pInformer,
+		npInformer:             npInformer,
+		eventGen:               eventGen,
+		eventRecorder:          eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "policy_controller"}),
+		queue:                  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "policy"),
+		configHandler:          configHandler,
+		informerCacheResolvers: informerCacheResolvers,
+		reconcilePeriod:        reconcilePeriod,
+		metricsConfig:          metricsConfig,
+		log:                    log,
 	}
 
 	pc.pLister = pInformer.Lister()
@@ -284,13 +294,13 @@ func (pc *PolicyController) Run(ctx context.Context, workers int) {
 		return
 	}
 
-	pc.pInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = pc.pInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    pc.addPolicy,
 		UpdateFunc: pc.updatePolicy,
 		DeleteFunc: pc.deletePolicy,
 	})
 
-	pc.npInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = pc.npInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    pc.addNsPolicy,
 		UpdateFunc: pc.updateNsPolicy,
 		DeleteFunc: pc.deleteNsPolicy,
@@ -367,11 +377,16 @@ func (pc *PolicyController) syncPolicy(key string) error {
 }
 
 func (pc *PolicyController) getPolicy(key string) (kyvernov1.PolicyInterface, error) {
-	namespace, key, isNamespacedPolicy := ParseNamespacedPolicy(key)
-	if !isNamespacedPolicy {
-		return pc.pLister.Get(key)
+	if ns, name, err := cache.SplitMetaNamespaceKey(key); err != nil {
+		pc.log.Error(err, "failed to parse policy name", "policyName", key)
+		return nil, err
+	} else {
+		isNamespacedPolicy := ns != ""
+		if !isNamespacedPolicy {
+			return pc.pLister.Get(name)
+		}
+		return pc.npLister.Policies(ns).Get(name)
 	}
-	return pc.npLister.Policies(namespace).Get(key)
 }
 
 func generateTriggers(client dclient.Interface, rule kyvernov1.Rule, log logr.Logger) []*unstructured.Unstructured {

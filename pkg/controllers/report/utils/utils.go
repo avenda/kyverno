@@ -22,8 +22,8 @@ func CanBackgroundProcess(logger logr.Logger, p kyvernov1.PolicyInterface) bool 
 	return true
 }
 
-func BuildKindSet(logger logr.Logger, policies ...kyvernov1.PolicyInterface) sets.String {
-	kinds := sets.NewString()
+func BuildKindSet(logger logr.Logger, policies ...kyvernov1.PolicyInterface) sets.Set[string] {
+	kinds := sets.New[string]()
 	for _, policy := range policies {
 		for _, rule := range autogen.ComputeRules(policy) {
 			if rule.HasValidate() || rule.HasVerifyImages() {
@@ -56,8 +56,11 @@ func RemoveNonValidationPolicies(logger logr.Logger, policies ...kyvernov1.Polic
 }
 
 func ReportsAreIdentical(before, after kyvernov1alpha2.ReportInterface) bool {
-	bLabels := sets.NewString()
-	aLabels := sets.NewString()
+	if !reflect.DeepEqual(before.GetAnnotations(), after.GetAnnotations()) {
+		return false
+	}
+	bLabels := sets.New[string]()
+	aLabels := sets.New[string]()
 	for key := range before.GetLabels() {
 		bLabels.Insert(key)
 	}

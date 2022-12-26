@@ -24,6 +24,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	"github.com/kyverno/kyverno/pkg/controllers/certmanager"
 	configcontroller "github.com/kyverno/kyverno/pkg/controllers/config"
+	genericwebhookcontroller "github.com/kyverno/kyverno/pkg/controllers/generic/webhook"
 	policymetricscontroller "github.com/kyverno/kyverno/pkg/controllers/metrics/policy"
 	openapicontroller "github.com/kyverno/kyverno/pkg/controllers/openapi"
 	policycachecontroller "github.com/kyverno/kyverno/pkg/controllers/policycache"
@@ -34,7 +35,7 @@ import (
 	webhookcontroller "github.com/kyverno/kyverno/pkg/controllers/webhook"
 	"github.com/kyverno/kyverno/pkg/cosign"
 	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
-	event "github.com/kyverno/kyverno/pkg/event"
+	"github.com/kyverno/kyverno/pkg/event"
 	"github.com/kyverno/kyverno/pkg/leaderelection"
 	"github.com/kyverno/kyverno/pkg/logging"
 	"github.com/kyverno/kyverno/pkg/metrics"
@@ -44,40 +45,41 @@ import (
 	"github.com/kyverno/kyverno/pkg/registryclient"
 	"github.com/kyverno/kyverno/pkg/tls"
 	"github.com/kyverno/kyverno/pkg/toggle"
-	"github.com/kyverno/kyverno/pkg/utils"
+	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	runtimeutils "github.com/kyverno/kyverno/pkg/utils/runtime"
 	"github.com/kyverno/kyverno/pkg/webhooks"
+	webhooksexception "github.com/kyverno/kyverno/pkg/webhooks/exception"
 	webhookspolicy "github.com/kyverno/kyverno/pkg/webhooks/policy"
 	webhooksresource "github.com/kyverno/kyverno/pkg/webhooks/resource"
 	webhookgenerate "github.com/kyverno/kyverno/pkg/webhooks/updaterequest"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	metadatainformers "k8s.io/client-go/metadata/metadatainformer"
 	kyamlopenapi "sigs.k8s.io/kustomize/kyaml/openapi"
 )
 
 const (
-	resyncPeriod = 15 * time.Minute
+	resyncPeriod                   = 15 * time.Minute
+	exceptionWebhookControllerName = "exception-webhook-controller"
 )
 
-func setupRegistryClient(logger logr.Logger, kubeClient kubernetes.Interface, imagePullSecrets string, allowInsecureRegistry bool) error {
+func setupRegistryClient(ctx context.Context, logger logr.Logger, lister corev1listers.SecretNamespaceLister, imagePullSecrets string, allowInsecureRegistry bool) (registryclient.Client, error) {
 	logger = logger.WithName("registry-client")
 	logger.Info("setup registry client...", "secrets", imagePullSecrets, "insecure", allowInsecureRegistry)
-	var registryOptions []registryclient.Option
+	registryOptions := []registryclient.Option{
+		registryclient.WithTracing(),
+	}
 	secrets := strings.Split(imagePullSecrets, ",")
 	if imagePullSecrets != "" && len(secrets) > 0 {
-		registryOptions = append(registryOptions, registryclient.WithKeychainPullSecrets(kubeClient, config.KyvernoNamespace(), "", secrets))
+		registryOptions = append(registryOptions, registryclient.WithKeychainPullSecrets(ctx, lister, secrets...))
 	}
 	if allowInsecureRegistry {
 		registryOptions = append(registryOptions, registryclient.WithAllowInsecureRegistry())
 	}
-	client, err := registryclient.InitClient(registryOptions...)
-	if err != nil {
-		return err
-	}
-	registryclient.DefaultClient = client
-	return nil
+	return registryclient.New(registryOptions...)
 }
 
 func setupCosign(logger logr.Logger, imageSignatureRepository string) {
@@ -88,12 +90,8 @@ func setupCosign(logger logr.Logger, imageSignatureRepository string) {
 	}
 }
 
-func showWarnings(logger logr.Logger, splitPolicyReport bool) {
+func showWarnings(logger logr.Logger) {
 	logger = logger.WithName("warnings")
-	// DEPRECATED: remove in 1.9
-	if splitPolicyReport {
-		logger.Info("The splitPolicyReport flag is deprecated and will be removed in v1.9. It has no effect and should be removed.")
-	}
 	// log if `forceFailurePolicyIgnore` flag has been set or not
 	if toggle.ForceFailurePolicyIgnore.Enabled() {
 		logger.Info("'ForceFailurePolicyIgnore' is enabled, all policies with policy failures will be set to Ignore")
@@ -101,7 +99,7 @@ func showWarnings(logger logr.Logger, splitPolicyReport bool) {
 }
 
 func sanityChecks(dynamicClient dclient.Interface) error {
-	if !utils.CRDsInstalled(dynamicClient.Discovery()) {
+	if !kubeutils.CRDsInstalled(dynamicClient.Discovery()) {
 		return fmt.Errorf("CRDs not installed")
 	}
 	return nil
@@ -112,15 +110,17 @@ func createNonLeaderControllers(
 	kubeInformer kubeinformers.SharedInformerFactory,
 	kubeKyvernoInformer kubeinformers.SharedInformerFactory,
 	kyvernoInformer kyvernoinformer.SharedInformerFactory,
-	kubeClient kubernetes.Interface,
 	kyvernoClient versioned.Interface,
 	dynamicClient dclient.Interface,
+	rclient registryclient.Client,
 	configuration config.Configuration,
 	policyCache policycache.Cache,
 	eventGenerator event.Interface,
 	manager openapi.Manager,
+	informerCacheResolvers resolvers.ConfigmapResolver,
 ) ([]internal.Controller, func() error) {
 	policyCacheController := policycachecontroller.NewController(
+		dynamicClient,
 		policyCache,
 		kyvernoInformer.Kyverno().V1().ClusterPolicies(),
 		kyvernoInformer.Kyverno().V1().Policies(),
@@ -136,6 +136,7 @@ func createNonLeaderControllers(
 	updateRequestController := background.NewController(
 		kyvernoClient,
 		dynamicClient,
+		rclient,
 		kyvernoInformer.Kyverno().V1().ClusterPolicies(),
 		kyvernoInformer.Kyverno().V1().Policies(),
 		kyvernoInformer.Kyverno().V1beta1().UpdateRequests(),
@@ -143,6 +144,7 @@ func createNonLeaderControllers(
 		kubeKyvernoInformer.Core().V1().Pods(),
 		eventGenerator,
 		configuration,
+		informerCacheResolvers,
 	)
 	return []internal.Controller{
 			internal.NewController(policycachecontroller.ControllerName, policyCacheController, policycachecontroller.Workers),
@@ -162,9 +164,12 @@ func createReportControllers(
 	backgroundScanWorkers int,
 	client dclient.Interface,
 	kyvernoClient versioned.Interface,
+	rclient registryclient.Client,
 	metadataFactory metadatainformers.SharedInformerFactory,
 	kubeInformer kubeinformers.SharedInformerFactory,
 	kyvernoInformer kyvernoinformer.SharedInformerFactory,
+	configMapResolver resolvers.ConfigmapResolver,
+	backgroundScanInterval time.Duration,
 ) ([]internal.Controller, func(context.Context) error) {
 	var ctrls []internal.Controller
 	var warmups []func(context.Context) error
@@ -212,11 +217,14 @@ func createReportControllers(
 				backgroundscancontroller.NewController(
 					client,
 					kyvernoClient,
+					rclient,
 					metadataFactory,
 					kyvernoV1.Policies(),
 					kyvernoV1.ClusterPolicies(),
 					kubeInformer.Core().V1().Namespaces(),
 					resourceReportController,
+					configMapResolver,
+					backgroundScanInterval,
 				),
 				backgroundScanWorkers,
 			))
@@ -247,21 +255,26 @@ func createrLeaderControllers(
 	kubeClient kubernetes.Interface,
 	kyvernoClient versioned.Interface,
 	dynamicClient dclient.Interface,
+	rclient registryclient.Client,
 	configuration config.Configuration,
 	metricsConfig metrics.MetricsConfigManager,
 	eventGenerator event.Interface,
 	certRenewer tls.CertRenewer,
 	runtime runtimeutils.Runtime,
+	configMapResolver resolvers.ConfigmapResolver,
+	backgroundScanInterval time.Duration,
 ) ([]internal.Controller, func(context.Context) error, error) {
 	policyCtrl, err := policy.NewPolicyController(
 		kyvernoClient,
 		dynamicClient,
+		rclient,
 		kyvernoInformer.Kyverno().V1().ClusterPolicies(),
 		kyvernoInformer.Kyverno().V1().Policies(),
 		kyvernoInformer.Kyverno().V1beta1().UpdateRequests(),
 		configuration,
 		eventGenerator,
 		kubeInformer.Core().V1().Namespaces(),
+		configMapResolver,
 		logging.WithName("PolicyController"),
 		time.Hour,
 		metricsConfig,
@@ -275,7 +288,6 @@ func createrLeaderControllers(
 	)
 	webhookController := webhookcontroller.NewController(
 		dynamicClient.Discovery(),
-		kubeClient.CoreV1().Secrets(config.KyvernoNamespace()),
 		kubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations(),
 		kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 		kubeClient.CoordinationV1().Leases(config.KyvernoNamespace()),
@@ -293,6 +305,28 @@ func createrLeaderControllers(
 		admissionReports,
 		runtime,
 	)
+	exceptionWebhookController := genericwebhookcontroller.NewController(
+		exceptionWebhookControllerName,
+		kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
+		kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
+		kubeKyvernoInformer.Core().V1().Secrets(),
+		config.ExceptionValidatingWebhookConfigurationName,
+		config.ExceptionValidatingWebhookServicePath,
+		serverIP,
+		[]admissionregistrationv1.RuleWithOperations{{
+			Rule: admissionregistrationv1.Rule{
+				APIGroups:   []string{"kyverno.io"},
+				APIVersions: []string{"v2alpha1"},
+				Resources:   []string{"policyexceptions"},
+			},
+			Operations: []admissionregistrationv1.OperationType{
+				admissionregistrationv1.Create,
+				admissionregistrationv1.Update,
+			},
+		}},
+		genericwebhookcontroller.Fail,
+		genericwebhookcontroller.None,
+	)
 	reportControllers, warmup := createReportControllers(
 		backgroundScan,
 		admissionReports,
@@ -300,15 +334,19 @@ func createrLeaderControllers(
 		backgroundScanWorkers,
 		dynamicClient,
 		kyvernoClient,
+		rclient,
 		metadataInformer,
 		kubeInformer,
 		kyvernoInformer,
+		configMapResolver,
+		backgroundScanInterval,
 	)
 	return append(
 			[]internal.Controller{
 				internal.NewController("policy-controller", policyCtrl, 2),
 				internal.NewController(certmanager.ControllerName, certManager, certmanager.Workers),
 				internal.NewController(webhookcontroller.ControllerName, webhookController, webhookcontroller.Workers),
+				internal.NewController(exceptionWebhookControllerName, exceptionWebhookController, 1),
 			},
 			reportControllers...,
 		),
@@ -335,8 +373,7 @@ func main() {
 		backgroundScanWorkers      int
 		dumpPayload                bool
 		leaderElectionRetryPeriod  time.Duration
-		// DEPRECATED: remove in 1.9
-		splitPolicyReport bool
+		backgroundScanInterval     time.Duration
 	)
 	flagset := flag.NewFlagSet("kyverno", flag.ExitOnError)
 	flagset.BoolVar(&dumpPayload, "dumpPayload", false, "Set this flag to activate/deactivate debug mode.")
@@ -356,8 +393,7 @@ func main() {
 	flagset.IntVar(&reportsChunkSize, "reportsChunkSize", 1000, "Max number of results in generated reports, reports will be split accordingly if there are more results to be stored.")
 	flagset.IntVar(&backgroundScanWorkers, "backgroundScanWorkers", backgroundscancontroller.Workers, "Configure the number of background scan workers.")
 	flagset.DurationVar(&leaderElectionRetryPeriod, "leaderElectionRetryPeriod", leaderelection.DefaultRetryPeriod, "Configure leader election retry period.")
-	// DEPRECATED: remove in 1.9
-	flagset.BoolVar(&splitPolicyReport, "splitPolicyReport", false, "This is deprecated, please don't use it, will be removed in v1.9.")
+	flagset.DurationVar(&backgroundScanInterval, "backgroundScanInterval", time.Hour, "Configure background scan interval.")
 	// config
 	appConfig := internal.NewConfiguration(
 		internal.WithProfiling(),
@@ -377,7 +413,7 @@ func main() {
 	signalCtx, logger, metricsConfig, sdown := internal.Setup()
 	defer sdown()
 	// show version
-	showWarnings(logger, splitPolicyReport)
+	showWarnings(logger)
 	// create instrumented clients
 	kubeClient := internal.CreateKubernetesClient(logger, kubeclient.WithMetrics(metricsConfig, metrics.KubeClient), kubeclient.WithTracing())
 	leaderElectionClient := internal.CreateKubernetesClient(logger, kubeclient.WithMetrics(metricsConfig, metrics.KubeClient), kubeclient.WithTracing())
@@ -389,13 +425,6 @@ func main() {
 		logger.Error(err, "failed to create dynamic client")
 		os.Exit(1)
 	}
-	// setup registry client
-	if err := setupRegistryClient(logger, kubeClient, imagePullSecrets, allowInsecureRegistry); err != nil {
-		logger.Error(err, "failed to setup registry client")
-		os.Exit(1)
-	}
-	// setup cosign
-	setupCosign(logger, imageSignatureRepository)
 	// THIS IS AN UGLY FIX
 	// ELSE KYAML IS NOT THREAD SAFE
 	kyamlopenapi.Schema()
@@ -413,6 +442,15 @@ func main() {
 		logger.Error(err, "failed to create cache informer factory")
 		os.Exit(1)
 	}
+	secretLister := kubeKyvernoInformer.Core().V1().Secrets().Lister().Secrets(config.KyvernoNamespace())
+	// setup registry client
+	rclient, err := setupRegistryClient(signalCtx, logger, secretLister, imagePullSecrets, allowInsecureRegistry)
+	if err != nil {
+		logger.Error(err, "failed to setup registry client")
+		os.Exit(1)
+	}
+	// setup cosign
+	setupCosign(logger, imageSignatureRepository)
 	informerBasedResolver, err := resolvers.NewInformerBasedResolver(cacheInformer.Core().V1().ConfigMaps().Lister())
 	if err != nil {
 		logger.Error(err, "failed to create informer based resolver")
@@ -440,6 +478,7 @@ func main() {
 	}
 	certRenewer := tls.NewCertRenewer(
 		kubeClient.CoreV1().Secrets(config.KyvernoNamespace()),
+		secretLister,
 		tls.CertRenewalInterval,
 		tls.CAValidityDuration,
 		tls.TLSValidityDuration,
@@ -471,13 +510,14 @@ func main() {
 		kubeInformer,
 		kubeKyvernoInformer,
 		kyvernoInformer,
-		kubeClient,
 		kyvernoClient,
 		dClient,
+		rclient,
 		configuration,
 		policyCache,
 		eventGenerator,
 		openApiManager,
+		configMapResolver,
 	)
 	// start informers and wait for cache sync
 	if !internal.StartInformersAndWaitForCacheSync(signalCtx, kyvernoInformer, kubeInformer, kubeKyvernoInformer, cacheInformer) {
@@ -529,11 +569,14 @@ func main() {
 				kubeClient,
 				kyvernoClient,
 				dClient,
+				rclient,
 				configuration,
 				metricsConfig,
 				eventGenerator,
 				certRenewer,
 				runtime,
+				configMapResolver,
+				backgroundScanInterval,
 			)
 			if err != nil {
 				logger.Error(err, "failed to create leader controllers")
@@ -593,6 +636,7 @@ func main() {
 	resourceHandlers := webhooksresource.NewHandlers(
 		dClient,
 		kyvernoClient,
+		rclient,
 		configuration,
 		metricsConfig,
 		policyCache,
@@ -601,22 +645,24 @@ func main() {
 		kubeInformer.Rbac().V1().RoleBindings().Lister(),
 		kubeInformer.Rbac().V1().ClusterRoleBindings().Lister(),
 		kyvernoInformer.Kyverno().V1beta1().UpdateRequests().Lister().UpdateRequests(config.KyvernoNamespace()),
+		kyvernoInformer.Kyverno().V2alpha1().PolicyExceptions().Lister(),
 		urgen,
 		eventGenerator,
 		openApiManager,
 		admissionReports,
 	)
-	secretLister := kubeKyvernoInformer.Core().V1().Secrets().Lister()
+	exceptionHandlers := webhooksexception.NewHandlers()
 	server := webhooks.NewServer(
 		policyHandlers,
 		resourceHandlers,
+		exceptionHandlers,
 		configuration,
 		metricsConfig,
 		webhooks.DebugModeOptions{
 			DumpPayload: dumpPayload,
 		},
 		func() ([]byte, []byte, error) {
-			secret, err := secretLister.Secrets(config.KyvernoNamespace()).Get(tls.GenerateTLSPairSecretName())
+			secret, err := secretLister.Get(tls.GenerateTLSPairSecretName())
 			if err != nil {
 				return nil, nil, err
 			}
